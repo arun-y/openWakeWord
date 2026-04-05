@@ -669,7 +669,7 @@ def convert_onnx_to_tflite(onnx_model_path, output_path):
                 + ", ".join(_missing_pip)
                 + "\nInstall: pip install "
                 + " ".join(_missing_pip)
-                + "\nOr: pip install -e '../openwakeword[tflite]'"
+                + "\nOr: pip install -e './openwakeword[tflite]'  (from wakeword-studio repo root; zsh: quote)"
             )
 
     def _run_onnx2tf(cmd_base):
@@ -714,7 +714,7 @@ def convert_onnx_to_tflite(onnx_model_path, output_path):
     if not _use_onnx_tf_fallback:
         raise RuntimeError(
             "ONNX→TFLite failed via onnx2tf (required on Python 3.12+).\n"
-            "Install: pip install -e '../openwakeword[tflite]'  (zsh: quote the path). "
+            "Install: pip install -e './openwakeword[tflite]'  (from wakeword-studio repo root; zsh: quote). "
             "Or: pip install onnx-graphsurgeon psutil sng4onnx onnx2tf tf_keras tensorflow\n"
             f"onnx2tf output:\n{err_tail or '(empty)'}"
         )

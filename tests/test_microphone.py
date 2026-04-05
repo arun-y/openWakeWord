@@ -1,8 +1,12 @@
+from pathlib import Path
+
 import numpy as np
 import pyaudio
 from openwakeword.model import Model
 
-MODEL_PATH = "/Users/aruny/Workspace/wakeupramu/wakeword-studio/models/ok_nova/output/ok_nova.onnx"
+# Parent of openwakeword repo = wakeword-studio monorepo root (models/ lives there)
+_MODEL_ROOT = Path(__file__).resolve().parents[2]
+MODEL_PATH = str(_MODEL_ROOT / "models" / "ok_nova" / "output" / "ok_nova.onnx")
 
 CHUNK_SIZE = 1280
 FORMAT = pyaudio.paInt16
