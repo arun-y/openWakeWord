@@ -1,3 +1,4 @@
+
 # Examples
 
 This folder contains examples of using openWakeWord with web applications.

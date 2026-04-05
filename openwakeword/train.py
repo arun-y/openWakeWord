@@ -3,7 +3,10 @@ from torch import optim, nn
 import torchinfo
 import torchmetrics
 import copy
+import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -12,13 +15,67 @@ import scipy
 import collections
 import argparse
 import logging
+from functools import partial
 from tqdm import tqdm
 import yaml
 from pathlib import Path
 import openwakeword
-from openwakeword.data import generate_adversarial_texts, augment_clips, mmap_batch_generator
+from openwakeword.data import (
+    augment_clips,
+    generate_adversarial_texts,
+    mmap_batch_feature_shape_transform,
+    mmap_batch_generator,
+    mmap_batch_labels_negative,
+    mmap_batch_labels_positive,
+)
 from openwakeword.utils import compute_features_from_generator
 from openwakeword.utils import AudioFeatures
+from openwakeword.torch_device import (
+    empty_accelerator_cache,
+    onnx_audio_features_device_str,
+    preferred_torch_device_str,
+)
+
+
+def _export_openwakeword_onnx(model, dummy_input, path, *, output_names=None, opset_version=13):
+    """
+    ONNX export via the TorchScript exporter only.
+
+    Avoids :func:`torch.onnx.export` when it routes through the dynamo exporter (PyTorch 2.9+),
+    which requires the optional ``onnxscript`` dependency.
+    """
+    import torch._C._onnx as _C_onnx
+    from torch.onnx._internal.torchscript_exporter.utils import export as _legacy_onnx_export
+
+    _legacy_onnx_export(
+        model,
+        dummy_input,
+        os.fspath(path),
+        kwargs=None,
+        export_params=True,
+        verbose=False,
+        input_names=None,
+        output_names=output_names,
+        opset_version=opset_version,
+        dynamic_axes=None,
+        keep_initializers_as_inputs=False,
+        training=_C_onnx.TrainingMode.EVAL,
+        operator_export_type=_C_onnx.OperatorExportTypes.ONNX,
+        do_constant_folding=True,
+        custom_opsets=None,
+        export_modules_as_functions=False,
+        autograd_inlining=True,
+    )
+
+
+class OpenWakeWordTrainingIterableDataset(torch.utils.data.IterableDataset):
+    """Wraps a generator for DataLoader. Defined at module scope so spawn workers can unpickle it."""
+
+    def __init__(self, generator):
+        self.generator = generator
+
+    def __iter__(self):
+        return self.generator
 
 
 # Base model class for an openwakeword model
@@ -31,7 +88,8 @@ class Model(nn.Module):
         self.n_classes = n_classes
         self.input_shape = input_shape
         self.seconds_per_example = seconds_per_example
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        device = preferred_torch_device_str()
+        self.device = torch.device(device)
         self.best_models = []
         self.best_model_scores = []
         self.best_val_fp = 1000
@@ -145,9 +203,13 @@ class Model(nn.Module):
         obj = self
         # Make simple model for export based on model structure
         if self.n_classes == 1:
-            # Save ONNX model
-            torch.onnx.export(self.model.to("cpu"), torch.rand(self.input_shape)[None, ], output_path,
-                              output_names=[class_mapping])
+            _export_openwakeword_onnx(
+                self.model.to("cpu"),
+                torch.rand(self.input_shape)[None,],
+                output_path,
+                output_names=[class_mapping],
+                opset_version=13,
+            )
 
         elif self.n_classes >= 1:
             class M(nn.Module):
@@ -160,9 +222,13 @@ class Model(nn.Module):
                 def forward(self, x):
                     return torch.nn.functional.softmax(self.model(x), dim=1)
 
-            # Save ONNX model
-            torch.onnx.export(M(), torch.rand(self.input_shape)[None, ], output_path,
-                              output_names=[class_mapping])
+            _export_openwakeword_onnx(
+                M(),
+                torch.rand(self.input_shape)[None,],
+                output_path,
+                output_names=[class_mapping],
+                opset_version=13,
+            )
 
     def lr_warmup_cosine_decay(self,
                                global_step,
@@ -426,8 +492,13 @@ class Model(nn.Module):
         # Save ONNX model
         logging.info(f"####\nSaving ONNX mode as '{os.path.join(output_dir, model_name + '.onnx')}'")
         model_to_save = copy.deepcopy(model)
-        torch.onnx.export(model_to_save.to("cpu"), torch.rand(self.input_shape)[None, ],
-                          os.path.join(output_dir, model_name + ".onnx"), opset_version=13)
+        _export_openwakeword_onnx(
+            model_to_save.to("cpu"),
+            torch.rand(self.input_shape)[None,],
+            os.path.join(output_dir, model_name + ".onnx"),
+            output_names=None,
+            opset_version=13,
+        )
 
         return None
 
@@ -572,13 +643,97 @@ class Model(nn.Module):
 
 # Separate function to convert onnx models to tflite format
 def convert_onnx_to_tflite(onnx_model_path, output_path):
-    """Converts an ONNX version of an openwakeword model to the Tensorflow tflite format."""
-    # imports
-    import onnx
-    from onnx_tf.backend import prepare
-    import tensorflow as tf
+    """Converts an ONNX openWakeWord model to TFLite.
 
-    # Convert to tflite from onnx model
+    Uses **onnx2tf** via ``python -m onnx2tf`` (same interpreter as this script).
+
+    On Python 3.12+, onnx-tf is not used (it depends on ``tensorflow-addons``, which has no wheels).
+    """
+    onnx_model_path = os.fspath(onnx_model_path)
+    output_path = os.fspath(output_path)
+    stem = Path(onnx_model_path).stem
+    _use_onnx_tf_fallback = sys.version_info < (3, 12)
+
+    if not _use_onnx_tf_fallback:
+        _deps = (
+            ("onnx_graphsurgeon", "onnx-graphsurgeon"),
+            ("tf_keras", "tf_keras"),
+            ("psutil", "psutil"),
+            ("sng4onnx", "sng4onnx"),
+            ("onnx2tf", "onnx2tf"),
+        )
+        _missing_pip = [pip for mod, pip in _deps if importlib.util.find_spec(mod) is None]
+        if _missing_pip:
+            raise RuntimeError(
+                "Missing packages for onnx2tf (Python 3.12+): "
+                + ", ".join(_missing_pip)
+                + "\nInstall: pip install "
+                + " ".join(_missing_pip)
+                + "\nOr: pip install -e '../openwakeword[tflite]'"
+            )
+
+    def _run_onnx2tf(cmd_base):
+        tmp = tempfile.mkdtemp(prefix="openwakeword_onnx2tf_")
+        try:
+            cmd = cmd_base + [
+                "-i",
+                onnx_model_path,
+                "-o",
+                tmp,
+                "-v",
+                "error",
+            ]
+            logging.info("Converting ONNX to TFLite via onnx2tf: %s", " ".join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout or "").strip()
+                if len(tail) > 1800:
+                    tail = "…" + tail[-1800:]
+                return False, tail
+            produced = os.path.join(tmp, f"{stem}_float32.tflite")
+            if not os.path.isfile(produced):
+                matches = list(Path(tmp).glob("*_float32.tflite"))
+                produced = str(matches[0]) if len(matches) == 1 else ""
+            if os.path.isfile(produced):
+                shutil.copyfile(produced, output_path)
+                logging.info("Saved TFLite model to '%s'", output_path)
+                return True, ""
+            return False, f"no *_float32.tflite under {tmp}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # Prefer same-interpreter module (avoids PATH issues with venv/onnx2tf script)
+    ok, err_tail = _run_onnx2tf([sys.executable, "-m", "onnx2tf"])
+    if not ok:
+        exe = shutil.which("onnx2tf")
+        if exe:
+            ok, err_tail = _run_onnx2tf([exe])
+    if ok:
+        return None
+
+    if not _use_onnx_tf_fallback:
+        raise RuntimeError(
+            "ONNX→TFLite failed via onnx2tf (required on Python 3.12+).\n"
+            "Install: pip install -e '../openwakeword[tflite]'  (zsh: quote the path). "
+            "Or: pip install onnx-graphsurgeon psutil sng4onnx onnx2tf tf_keras tensorflow\n"
+            f"onnx2tf output:\n{err_tail or '(empty)'}"
+        )
+
+    logging.warning("onnx2tf failed; trying legacy onnx-tf…\n%s", err_tail or "(no stderr)")
+
+    try:
+        import onnx
+        from onnx_tf.backend import prepare
+        import tensorflow as tf
+    except ImportError as exc:
+        raise RuntimeError(
+            "ONNX→TFLite needs onnx2tf or onnx-tf.\n"
+            "  Recommended: pip install onnx2tf tf_keras tensorflow\n"
+            "  Legacy (Python 3.11 only): pip install tensorflow onnx-tf "
+            "'onnx>=1.14,<1.19' tensorflow-addons\n"
+            f"Original error: {exc}"
+        ) from exc
+
     onnx_model = onnx.load(onnx_model_path)
     tf_rep = prepare(onnx_model, device="CPU")
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -587,13 +742,15 @@ def convert_onnx_to_tflite(onnx_model_path, output_path):
         tflite_model = converter.convert()
 
         logging.info(f"####\nSaving tflite mode to '{output_path}'")
-        with open(output_path, 'wb') as f:
+        with open(output_path, "wb") as f:
             f.write(tflite_model)
 
     return None
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
     # Get training config file
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -637,16 +794,33 @@ if __name__ == '__main__':
         default="False",
         required=False
     )
+    parser.add_argument(
+        "--convert_to_tflite_only",
+        help="Only convert existing {output_dir}/{model_name}.onnx to .tflite (no training or data steps)",
+        action="store_true",
+        default=False,
+        required=False,
+    )
 
     args = parser.parse_args()
     config = yaml.load(open(args.training_config, 'r').read(), yaml.Loader)
 
+    # Define output locations
+    config["output_dir"] = os.path.abspath(config["output_dir"])
+
+    if args.convert_to_tflite_only:
+        onnx_path = os.path.join(config["output_dir"], config["model_name"] + ".onnx")
+        tflite_path = os.path.join(config["output_dir"], config["model_name"] + ".tflite")
+        if not os.path.isfile(onnx_path):
+            raise SystemExit(f"ONNX model not found: {onnx_path}")
+        logging.info("Converting ONNX to TFLite: %s -> %s", onnx_path, tflite_path)
+        convert_onnx_to_tflite(onnx_path, tflite_path)
+        logging.info("Done: %s", tflite_path)
+        sys.exit(0)
+
     # imports Piper for synthetic sample generation
     sys.path.insert(0, os.path.abspath(config["piper_sample_generator_path"]))
     from generate_samples import generate_samples
-
-    # Define output locations
-    config["output_dir"] = os.path.abspath(config["output_dir"])
     if not os.path.exists(config["output_dir"]):
         os.mkdir(config["output_dir"])
     if not os.path.exists(os.path.join(config["output_dir"], config["model_name"])):
@@ -680,7 +854,7 @@ if __name__ == '__main__':
                 output_dir=positive_train_output_dir, auto_reduce_batch_size=True,
                 file_names=[uuid.uuid4().hex + ".wav" for i in range(config["n_samples"])]
             )
-            torch.cuda.empty_cache()
+            empty_accelerator_cache()
         else:
             logging.warning(f"Skipping generation of positive clips for training, as ~{config['n_samples']} already exist")
 
@@ -694,7 +868,7 @@ if __name__ == '__main__':
                              batch_size=config["tts_batch_size"],
                              noise_scales=[1.0], noise_scale_ws=[1.0], length_scales=[0.75, 1.0, 1.25],
                              output_dir=positive_test_output_dir, auto_reduce_batch_size=True)
-            torch.cuda.empty_cache()
+            empty_accelerator_cache()
         else:
             logging.warning(f"Skipping generation of positive clips testing, as ~{config['n_samples_val']} already exist")
 
@@ -717,7 +891,7 @@ if __name__ == '__main__':
                              output_dir=negative_train_output_dir, auto_reduce_batch_size=True,
                              file_names=[uuid.uuid4().hex + ".wav" for i in range(config["n_samples"])]
                              )
-            torch.cuda.empty_cache()
+            empty_accelerator_cache()
         else:
             logging.warning(f"Skipping generation of negative clips for training, as ~{config['n_samples']} already exist")
 
@@ -738,7 +912,7 @@ if __name__ == '__main__':
                              batch_size=config["tts_batch_size"]//7,
                              noise_scales=[1.0], noise_scale_ws=[1.0], length_scales=[0.75, 1.0, 1.25],
                              output_dir=negative_test_output_dir, auto_reduce_batch_size=True)
-            torch.cuda.empty_cache()
+            empty_accelerator_cache()
         else:
             logging.warning(f"Skipping generation of negative clips for testing, as ~{config['n_samples_val']} already exist")
 
@@ -794,25 +968,25 @@ if __name__ == '__main__':
             compute_features_from_generator(positive_clips_train_generator, n_total=len(os.listdir(positive_train_output_dir)),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "positive_features_train.npy"),
-                                            device="gpu" if torch.cuda.is_available() else "cpu",
+                                            device=onnx_audio_features_device_str(),
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
             compute_features_from_generator(negative_clips_train_generator, n_total=len(os.listdir(negative_train_output_dir)),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "negative_features_train.npy"),
-                                            device="gpu" if torch.cuda.is_available() else "cpu",
+                                            device=onnx_audio_features_device_str(),
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
             compute_features_from_generator(positive_clips_test_generator, n_total=len(os.listdir(positive_test_output_dir)),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "positive_features_test.npy"),
-                                            device="gpu" if torch.cuda.is_available() else "cpu",
+                                            device=onnx_audio_features_device_str(),
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
             compute_features_from_generator(negative_clips_test_generator, n_total=len(os.listdir(negative_test_output_dir)),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "negative_features_test.npy"),
-                                            device="gpu" if torch.cuda.is_available() else "cpu",
+                                            device=onnx_audio_features_device_str(),
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
         else:
             logging.warning("Openwakeword features already exist, skipping data augmentation and feature generation")
@@ -825,24 +999,18 @@ if __name__ == '__main__':
         oww = Model(n_classes=1, input_shape=input_shape, model_type=config["model_type"],
                     layer_dim=config["layer_size"], seconds_per_example=1280*input_shape[0]/16000)
 
-        # Create data transform function for batch generation to handle differ clip lengths (todo: write tests for this)
-        def f(x, n=input_shape[0]):
-            """Simple transformation function to ensure negative data is the appropriate shape for the model size"""
-            if n > x.shape[1] or n < x.shape[1]:
-                x = np.vstack(x)
-                new_batch = np.array([x[i:i+n, :] for i in range(0, x.shape[0]-n, n)])
-            else:
-                return x
-            return new_batch
-
-        # Create label transforms as needed for model (currently only supports binary classification models)
-        data_transforms = {key: f for key in config["feature_data_files"].keys()}
+        # Picklable transforms for DataLoader workers (spawn multiprocessing cannot pickle lambdas / local defs)
+        n_timesteps = input_shape[0]
+        data_transforms = {
+            key: partial(mmap_batch_feature_shape_transform, n=n_timesteps)
+            for key in config["feature_data_files"].keys()
+        }
         label_transforms = {}
         for key in ["positive"] + list(config["feature_data_files"].keys()) + ["adversarial_negative"]:
             if key == "positive":
-                label_transforms[key] = lambda x: [1 for i in x]
+                label_transforms[key] = mmap_batch_labels_positive
             else:
-                label_transforms[key] = lambda x: [0 for i in x]
+                label_transforms[key] = mmap_batch_labels_negative
 
         # Add generated positive and adversarial negative clips to the feature data files dictionary
         config["feature_data_files"]['positive'] = os.path.join(feature_save_dir, "positive_features_train.npy")
@@ -856,20 +1024,17 @@ if __name__ == '__main__':
             label_transform_funcs=label_transforms
         )
 
-        class IterDataset(torch.utils.data.IterableDataset):
-            def __init__(self, generator):
-                self.generator = generator
-
-            def __iter__(self):
-                return self.generator
-
         n_cpus = os.cpu_count()
         if n_cpus is None:
             n_cpus = 1
         else:
             n_cpus = n_cpus//2
-        X_train = torch.utils.data.DataLoader(IterDataset(batch_generator),
-                                              batch_size=None, num_workers=n_cpus, prefetch_factor=16)
+        X_train = torch.utils.data.DataLoader(
+            OpenWakeWordTrainingIterableDataset(batch_generator),
+            batch_size=None,
+            num_workers=n_cpus,
+            prefetch_factor=16,
+        )
 
         X_val_fp = np.load(config["false_positive_validation_data_path"])
         X_val_fp = np.array([X_val_fp[i:i+input_shape[0]] for i in range(0, X_val_fp.shape[0]-input_shape[0], 1)])  # reshape to match model

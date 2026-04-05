@@ -26,14 +26,22 @@ import numpy as np
 import itertools
 import pronouncing
 import torch
+from openwakeword.torch_device import preferred_torch_device
 import audiomentations
 import torch_audiomentations
 from numpy.lib.format import open_memmap
-from speechbrain.dataio.dataio import read_audio
-from speechbrain.processing.signal_processing import reverberate
+def _read_audio(path):
+    from speechbrain.dataio.dataio import read_audio
+    return read_audio(path)
+
+def _reverberate(waveform, rir_waveform, rescale_amp="avg"):
+    from speechbrain.processing.signal_processing import reverberate
+    return reverberate(waveform, rir_waveform, rescale_amp=rescale_amp)
 import torchaudio
 import mutagen
-import acoustics
+import importlib as _importlib
+def _acoustics():
+    return _importlib.import_module("acoustics")
 
 
 # Load audio clips and structure into clips of the same length
@@ -85,7 +93,7 @@ def load_audio_clips(files, clip_size=32000):
     audio_data = []
     for i in files:
         try:
-            audio_data.append(read_audio(i))
+            audio_data.append(_read_audio(i))
         except ValueError:
             continue
 
@@ -394,7 +402,7 @@ def mix_clips_batch(
         # Load foreground clips/start indices and truncate as needed
         sr = 16000
         start_index_batch = start_index[i:i+batch_size]
-        foreground_clips_batch = [read_audio(j) for j in foreground_clips[i:i+batch_size]]
+        foreground_clips_batch = [_read_audio(j) for j in foreground_clips[i:i+batch_size]]
         foreground_clips_batch = [j[0] if len(j.shape) > 1 else j for j in foreground_clips_batch]
         if foreground_durations:
             foreground_clips_batch = [truncate_clip(j, int(k*sr), foreground_truncate_strategy)
@@ -402,7 +410,7 @@ def mix_clips_batch(
         labels_batch = np.array(labels[i:i+batch_size])
 
         # Load background clips and pad/truncate as needed
-        background_clips_batch = [read_audio(j) for j in random.sample(background_clips, batch_size)]
+        background_clips_batch = [_read_audio(j) for j in random.sample(background_clips, batch_size)]
         background_clips_batch = [j[0] if len(j.shape) > 1 else j for j in background_clips_batch]
         background_clips_batch_delayed = []
         delay = np.random.randint(return_background_clips_delay[0], return_background_clips_delay[1] + 1)
@@ -431,7 +439,7 @@ def mix_clips_batch(
 
             if np.random.random() < generated_noise_augmentation:
                 noise_color = ["white", "pink", "blue", "brown", "violet"]
-                noise_clip = acoustics.generator.noise(combined_size, color=np.random.choice(noise_color))
+                noise_clip = _acoustics().generator.noise(combined_size, color=np.random.choice(noise_color))
                 noise_clip = torch.from_numpy(noise_clip/noise_clip.max())
                 mixed_clip = mix_clip(mixed_clip, noise_clip, np.random.choice(snrs_db), 0)
 
@@ -446,7 +454,7 @@ def mix_clips_batch(
                 rir_waveform, sr = torchaudio.load(random.choice(rirs))
                 if rir_waveform.shape[0] > 1:
                     rir_waveform = rir_waveform[random.randint(0, rir_waveform.shape[0]-1), :]
-                mixed_clips_batch = reverberate(mixed_clips_batch, rir_waveform, rescale_amp="avg")
+                mixed_clips_batch = _reverberate(mixed_clips_batch, rir_waveform, rescale_amp="avg")
 
         # Apply volume augmentation
         if volume_augmentation:
@@ -549,7 +557,7 @@ def apply_reverb(x, rir_files):
     # Apply reverberation to the batch (from a single RIR file)
     if rir_waveform.shape[0] > 1:
         rir_waveform = rir_waveform[random.randint(0, rir_waveform.shape[0]-1), :]
-    reverbed = reverberate(torch.from_numpy(x), rir_waveform, rescale_amp="avg")
+    reverbed = _reverberate(torch.from_numpy(x), rir_waveform, rescale_amp="avg")
 
     return reverbed.numpy()
 
@@ -685,13 +693,14 @@ def augment_clips(
             augmented_clips.append(torch.from_numpy(augment1(samples=clip_data, sample_rate=sr)))
 
         # Do second pass augmentations
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        device = preferred_torch_device()
         augmented_batch = augment2(samples=torch.vstack(augmented_clips).unsqueeze(dim=1).to(device), sample_rate=sr).squeeze(axis=1)
 
         # Do reverberation
         if augmentation_probabilities["RIR"] >= np.random.random() and RIR_paths != []:
-            rir_waveform, sr = torchaudio.load(random.choice(RIR_paths))
-            augmented_batch = reverberate(augmented_batch.cpu(), rir_waveform, rescale_amp="avg")
+            # Do not assign to `sr` — it shadows the clip sample rate and breaks the next batch.
+            rir_waveform, _rir_sr = torchaudio.load(random.choice(RIR_paths))
+            augmented_batch = _reverberate(augmented_batch.cpu(), rir_waveform, rescale_amp="avg")
 
         # yield batch of 16-bit PCM audio data
         yield (augmented_batch.cpu().numpy()*32767).astype(np.int16)
@@ -727,6 +736,26 @@ def create_fixed_size_clip(x, n_samples, sr=16000, start=None, end_jitter=.200):
         dat[start:start+len(x)] = x
 
     return dat
+
+
+def mmap_batch_labels_positive(y_batch):
+    """Pickle-safe label transform for positive class (used with mmap_batch_generator + DataLoader workers)."""
+    return [1 for _ in y_batch]
+
+
+def mmap_batch_labels_negative(y_batch):
+    """Pickle-safe label transform for negative / adversarial class."""
+    return [0 for _ in y_batch]
+
+
+def mmap_batch_feature_shape_transform(x, n):
+    """Reshape variable-length feature batches to fixed timesteps ``n`` for the model."""
+    if n > x.shape[1] or n < x.shape[1]:
+        x = np.vstack(x)
+        new_batch = np.array([x[i : i + n, :] for i in range(0, x.shape[0] - n, n)])
+    else:
+        return x
+    return new_batch
 
 
 # Load batches of data from mmaped numpy arrays

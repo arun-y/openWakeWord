@@ -26,6 +26,7 @@ import openwakeword
 from numpy.lib.format import open_memmap
 from typing import Union, List, Callable, Deque
 import requests
+from openwakeword.torch_device import resolve_onnx_providers
 
 
 # Base class for computing audio features using Google's speech_embedding
@@ -55,10 +56,8 @@ class AudioFeatures():
                                        "tflite" or "onnx". The default is "tflite" as this results in better
                                        efficiency on common platforms (x86, ARM64), but in some deployment
                                        scenarios ONNX models may be preferable.
-            device (str): The device to use when running the models, either "cpu" or "gpu" (default is "cpu".)
-                          Note that depending on the inference framework selected and system configuration,
-                          this setting may not have an effect. For example, to use a GPU with the ONNX
-                          framework the appropriate onnxruntime package must be installed.
+            device (str): ONNX inference only: "cpu" or "gpu" (default "cpu"). "gpu" prefers CUDAExecutionProvider,
+                          then CoreMLExecutionProvider on macOS, then CPU fallback.
         """
         # Initialize the models with the appropriate framework
         if inference_framework == "onnx":
@@ -80,16 +79,19 @@ class AudioFeatures():
             sessionOptions.inter_op_num_threads = ncpu
             sessionOptions.intra_op_num_threads = ncpu
 
+            providers = resolve_onnx_providers(device=device)
+
             # Melspectrogram model
             self.melspec_model = ort.InferenceSession(melspec_model_path, sess_options=sessionOptions,
-                                                      providers=["CUDAExecutionProvider"] if device == "gpu" else ["CPUExecutionProvider"])
+                                                      providers=providers)
             self.onnx_execution_provider = self.melspec_model.get_providers()[0]
+            self.onnx_is_accelerated = ("CUDA" in self.onnx_execution_provider
+                                        or "CoreML" in self.onnx_execution_provider)
             self.melspec_model_predict = lambda x: self.melspec_model.run(None, {'input': x})
 
             # Audio embedding model
             self.embedding_model = ort.InferenceSession(embedding_model_path, sess_options=sessionOptions,
-                                                        providers=["CUDAExecutionProvider"] if device == "gpu"
-                                                        else ["CPUExecutionProvider"])
+                                                        providers=providers)
             self.embedding_model_predict = lambda x: self.embedding_model.run(None, {'input_1': x})[0].squeeze()
 
         elif inference_framework == "tflite":
@@ -273,7 +275,7 @@ class AudioFeatures():
         for i in range(0, max(batch_size, x.shape[0]), batch_size):
             batch = x[i:i+batch_size]
 
-            if "CUDA" in self.onnx_execution_provider:
+            if self.onnx_is_accelerated:
                 result = self._get_melspectrogram(batch)
 
             elif pool:
@@ -335,7 +337,7 @@ class AudioFeatures():
 
             if len(batch) >= batch_size or ndx+1 == x.shape[0]:
                 batch = np.array(batch).astype(np.float32)
-                if "CUDA" in self.onnx_execution_provider:
+                if self.onnx_is_accelerated:
                     result = self.embedding_model_predict(batch)
 
                 elif pool:
@@ -553,7 +555,7 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
         output_file (str): The output file (.npy) containing the audio features. Note that this file
                            will be written to using memmap arrays, so it can be substantially larger
                            than the available system memory.
-        device (str): The device ("cpu" or "gpu") to use for computing features.
+        device (str): ONNX only: "cpu" or "gpu" (CUDA EP). Not PyTorch MPS; use "cpu" on Mac unless using CUDA onnxruntime.
         ncpu (int): The number of cores to use when process the audio features (if computing on CPU)
 
     Returns:
@@ -561,6 +563,8 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
     """
     # Function specific imports
     from openwakeword.data import trim_mmap
+
+    print(f"Using device: {device}")
 
     # Create audio features object
     F = AudioFeatures(device=device)
